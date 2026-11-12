@@ -1,6 +1,8 @@
 # LTE-STRIKE v1.1
 ## Progressive MiTM Framework for 4G Interception/GTP-C MITM/IMSI Catching/LTE Emulation
 
+![logo](./Logo.png)
+
 **ONLY FOR ENGINEERING & RESEARCH PURPOSES**
 **AUTHOR'S DISCLAIMER:**
 The author of this tool bears no responsibility for your actions and is not involved in any simulations performed by you. You are solely responsible for compliance with all applicable laws and regulations. Any misuse, illegal activities, or unauthorized testing conducted with this software is entirely your own liability.
@@ -57,7 +59,7 @@ All configuration files are stored in the same directory as the script:
 
 # Stop all processes
 ./LTE-STRIKE.sh --stop
-
+```
 # Attack Flow
 
 The script follows this specific execution order:
